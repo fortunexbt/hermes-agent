@@ -3148,25 +3148,32 @@ def run_job(
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
         # Initialize MCP servers so configured mcp_servers are available to
-        # the agent's tool registry before AIAgent is constructed. Without
-        # this, cron jobs never saw any MCP tools — only the gateway / CLI
+        # the agent's tool registry before AIAgent is constructed. Jobs that
+        # explicitly include the ``no_mcp`` sentinel opted out of MCP entirely;
+        # skip discovery as well as tool exposure so broken servers cannot add
+        # retry latency to an unrelated cron run. Without this discovery step,
+        # MCP-enabled cron jobs never saw MCP tools — only the gateway / CLI
         # paths called discover_mcp_tools() at startup. Idempotent: subsequent
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        mcp_opted_out = "no_mcp" in (job.get("enabled_toolsets") or [])
+        if not mcp_opted_out:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
+        else:
+            logger.debug("Job '%s': MCP initialization skipped by no_mcp", job_id)
 
         agent = AIAgent(
             model=model,
