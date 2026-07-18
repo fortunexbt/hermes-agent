@@ -106,6 +106,7 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.openai_quota import cancel_current as cancel_openai_quota, finalize_response as finalize_openai_quota, preflight as preflight_openai_quota
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -3856,6 +3857,9 @@ def _call_fallback_candidate_sync(
     fallback tuned differently from the primary is allowed its own budget
     (#62452).
     """
+    # A failed direct-OpenAI attempt must not be charged by the response from
+    # its non-OpenAI fallback candidate.
+    cancel_openai_quota()
     fb_timeout = _fallback_entry_timeout(task, fb_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
@@ -3922,6 +3926,9 @@ async def _call_fallback_candidate_async(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
+    # A failed direct-OpenAI attempt must not be charged by the response from
+    # its non-OpenAI fallback candidate.
+    cancel_openai_quota()
     fb_timeout = _fallback_entry_timeout(task, fb_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
@@ -6820,6 +6827,10 @@ def _validate_llm_response(
         )
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
+    # Commit any direct-OpenAI preflight reservation before validation. The
+    # reservation is context-local, so fallback responses cannot charge it
+    # after the fallback path cancels it.
+    finalize_openai_quota(response)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -7075,6 +7086,9 @@ def call_llm(
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
+        preflight_openai_quota(
+            resolved_provider, final_model, messages, max_tokens, tools, _base_info
+        )
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
         # 408) before the except-chain below escalates to provider/model
@@ -7674,6 +7688,9 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
+        preflight_openai_quota(
+            resolved_provider, final_model, messages, max_tokens, tools, _client_base
+        )
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
